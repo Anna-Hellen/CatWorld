@@ -25,6 +25,12 @@ class HUD:
         self.font_small = pygame.font.SysFont("Segoe UI", 22)
         self.font_tiny  = pygame.font.SysFont("Segoe UI", 18)
         self._pulse = 0.0
+        # Cache de superfícies de texto: fontes renderizadas 1x por
+        # (texto, fonte, cor) em vez de a cada frame
+        self._text_cache = {}
+        self._minimap_bg = None
+        self._fps_acc = 0.0
+        self._fps_surf = None
 
     def update(self, dt):
         self._pulse += dt * 3
@@ -69,10 +75,13 @@ class HUD:
     def draw_minimap(self, cat_pos, fishes, world_x, world_z):
         S = 120; PAD = 10
         mx = self.W - S - PAD; my = self.H - S - PAD
-        surf = pygame.Surface((S, S), pygame.SRCALPHA)
-        surf.fill((85, 70, 55, 175))
-        pygame.draw.rect(surf, (210, 180, 145), (0, 0, S, S), 2, border_radius=6)
-        self.screen.blit(surf, (mx, my))
+        if self._minimap_bg is None:
+            bg = pygame.Surface((S, S), pygame.SRCALPHA)
+            bg.fill((85, 70, 55, 175))
+            pygame.draw.rect(bg, (210, 180, 145), (0, 0, S, S), 2,
+                             border_radius=6)
+            self._minimap_bg = bg
+        self.screen.blit(self._minimap_bg, (mx, my))
 
         def wm(x, z):
             nx = (x - world_x[0]) / (world_x[1] - world_x[0])
@@ -179,7 +188,24 @@ class HUD:
 
     def _text(self, text, x, y, font, color,
               center=False, right=False):
-        surf = font.render(text, True, color)
+        key = (text, id(font), color)
+        surf = self._text_cache.get(key)
+        if surf is None:
+            surf = font.render(text, True, color)
+            if len(self._text_cache) > 300:   # evita crescer sem limite
+                self._text_cache.clear()
+            self._text_cache[key] = surf
         if center:  x -= surf.get_width() // 2
         elif right: x -= surf.get_width()
         self.screen.blit(surf, (x, y))
+
+    def draw_fps(self, fps, quality_name):
+        """Contador de FPS + qualidade atual (F3 alterna, F1 muda qualidade)."""
+        self._fps_acc -= 1
+        if self._fps_surf is None or self._fps_acc <= 0:
+            self._fps_acc = 15   # atualiza a cada ~15 frames
+            txt = f"{fps:4.0f} FPS  |  {quality_name} (F1)"
+            self._fps_surf = self.font_tiny.render(txt, True, (110, 85, 70))
+        self.screen.blit(self._fps_surf,
+                         (self.W - self._fps_surf.get_width() - 10,
+                          self.H - 26))

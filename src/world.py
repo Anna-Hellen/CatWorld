@@ -1,5 +1,11 @@
 """
-world.py – Jardim aconchegante: cerejeiras, cogumelos, lanternas, arbustos
+world.py – Mundo cozy com BATCH ESTÁTICO (otimização principal)
+
+Todo o cenário fixo (chão, muros, cercas, flores, cogumelos, arbustos,
+lanternas, casas, árvores, caixotes) é fundido em um único StaticBatch
+no carregamento: transformações aplicadas e iluminação pré-calculada.
+Por frame, o custo do cenário inteiro = 1 multiplicação de matriz +
+culling/ordenação vetorizados, em vez de ~280 chamadas separadas.
 """
 
 import numpy as np
@@ -7,12 +13,14 @@ import math
 import random
 from typing import List
 
-from renderer import Renderer
-from math3d import translation_matrix, rotation_y
-from geometry import (floor_tile_mesh, wall_segment_mesh,
+from renderer import Renderer, StaticBatch
+from math3d import translation_matrix, rotation_y, scale_matrix
+from geometry import (floor_tile_mesh, wall_segment_mesh, crate_mesh,
+                      stone_mesh, tree_mesh, house_mesh, flower_mesh,
+                      mushroom_mesh, lantern_mesh, bush_mesh,
+                      fence_segment_mesh,
                       C_GRASS_A, C_GRASS_B, C_GRASS_C, C_PATH)
-from entities import (Fish, Obstacle, Tree, House, Flower, Fence,
-                      Mushroom, Lantern, Bush)
+from entities import Fish
 from collision import AABB, make_aabb
 
 WORLD_X = (-22, 22)
@@ -20,20 +28,36 @@ WORLD_Z = (-22, 22)
 WALL_H  = 2.2
 
 
+def _M(x, y, z, yaw=0.0, s=1.0):
+    """Helper: matriz model T·Ry·S."""
+    M = translation_matrix(x, y, z) @ rotation_y(yaw)
+    if s != 1.0:
+        M = M @ scale_matrix(s, s, s)
+    return M
+
+
 class World:
     TILE_SIZE = 4.0
 
-    def __init__(self, seed=42, n_fish=15, n_stars=3):
+    def __init__(self, seed=42, n_fish=15, n_stars=3, density=1.0):
+        """density: 0..1 — fator de quantidade de decoração (qualidade)."""
         random.seed(seed)
-        self._build_floor()
-        self._build_walls()
-        self._build_obstacles()
-        self._build_decorations()
+        self.density = density
+        pairs = []            # (Mesh, model) para o batch estático
+        self._aabbs: List[AABB] = []
+
+        self._build_floor(pairs)
+        self._build_walls(pairs)
+        self._build_obstacles(pairs)
+        self._build_decorations(pairs)
         self._spawn_collectibles(n_fish, n_stars)
 
-    def _build_floor(self):
-        """Grama em 3 tons pastel + caminho de areia em cruz."""
-        self._floor_tiles = []
+        # ★ Funde tudo em um único batch com iluminação baked
+        self.static_batch = StaticBatch(pairs)
+
+    # ── Construção ───────────────────────────────────────────────────────────
+
+    def _build_floor(self, pairs):
         t = self.TILE_SIZE
         meshes = {
             'a': floor_tile_mesh(t, C_GRASS_A),
@@ -41,9 +65,9 @@ class World:
             'c': floor_tile_mesh(t, C_GRASS_C),
             'p': floor_tile_mesh(t, C_PATH),
         }
+        rng = random.Random(7)
         xs = np.arange(WORLD_X[0], WORLD_X[1], t)
         zs = np.arange(WORLD_Z[0], WORLD_Z[1], t)
-        rng = random.Random(7)
         for xi, x in enumerate(xs):
             for zi, z in enumerate(zs):
                 cx, cz = x + t/2, z + t/2
@@ -52,29 +76,25 @@ class World:
                 else:
                     r = rng.random()
                     key = 'c' if r < 0.18 else ('a' if (xi+zi)%2==0 else 'b')
-                self._floor_tiles.append(
-                    (meshes[key], translation_matrix(cx, 0, cz)))
+                pairs.append((meshes[key], _M(cx, 0, cz)))
 
-    def _build_walls(self):
+    def _build_walls(self, pairs):
         lx = WORLD_X[1]-WORLD_X[0]; lz = WORLD_Z[1]-WORLD_Z[0]
-        cx = 0.0; cz = 0.0; hw = WALL_H/2
+        hw = WALL_H/2
         mx = wall_segment_mesh(lx, WALL_H)
         mz = wall_segment_mesh(lz, WALL_H)
-        R90 = rotation_y(math.pi/2)
-        self._wall_data = [
-            (mx, translation_matrix(cx, 0, WORLD_Z[0])),
-            (mx, translation_matrix(cx, 0, WORLD_Z[1])),
-            (mz, translation_matrix(WORLD_X[1], 0, cz) @ R90),
-            (mz, translation_matrix(WORLD_X[0], 0, cz) @ R90),
-        ]
-        self.wall_aabbs: List[AABB] = [
-            make_aabb((cx, hw, WORLD_Z[0]), (lx/2, hw, 0.9)),
-            make_aabb((cx, hw, WORLD_Z[1]), (lx/2, hw, 0.9)),
-            make_aabb((WORLD_X[1], hw, cz), (0.9, hw, lz/2)),
-            make_aabb((WORLD_X[0], hw, cz), (0.9, hw, lz/2)),
+        pairs.append((mx, _M(0, 0, WORLD_Z[0])))
+        pairs.append((mx, _M(0, 0, WORLD_Z[1])))
+        pairs.append((mz, _M(WORLD_X[1], 0, 0, yaw=math.pi/2)))
+        pairs.append((mz, _M(WORLD_X[0], 0, 0, yaw=math.pi/2)))
+        self._aabbs += [
+            make_aabb((0, hw, WORLD_Z[0]), (lx/2, hw, 0.9)),
+            make_aabb((0, hw, WORLD_Z[1]), (lx/2, hw, 0.9)),
+            make_aabb((WORLD_X[1], hw, 0), (0.9, hw, lz/2)),
+            make_aabb((WORLD_X[0], hw, 0), (0.9, hw, lz/2)),
         ]
 
-    def _build_obstacles(self):
+    def _build_obstacles(self, pairs):
         positions = [
             (-8,-8,1.4,1.5,1.4), ( 8,-8,1.6,1.3,1.6),
             (-8, 8,1.3,1.6,1.3), ( 8, 8,1.7,1.2,1.7),
@@ -85,11 +105,16 @@ class World:
             (-3,15,1.2,1.6,1.2), ( 3,-15,1.3,1.5,1.3),
             (16,10,1.5,1.4,1.5),(-16,-10,1.4,1.3,1.4),
         ]
-        self.obstacles = [Obstacle(x,z,w,h,d) for x,z,w,h,d in positions]
+        self._obstacle_centers = []
+        for x, z, w, h, d in positions:
+            mesh = stone_mesh(w,h,d) if h < 1.0 else crate_mesh(w,h,d)
+            pairs.append((mesh, _M(x, 0, z)))
+            self._aabbs.append(make_aabb((x, h/2, z), (w/2, h/2, d/2)))
+            self._obstacle_centers.append((x, z))
 
-    def _build_decorations(self):
-        # Árvores – mistura de verdes e CEREJEIRAS rosas
-        self.trees: List[Tree] = []
+    def _build_decorations(self, pairs):
+        d = self.density
+        # Árvores (verdes + cerejeiras)
         tree_data = [
             (-18,-18,1.2,True),( 18,-18,1.0,False),(-18,18,1.3,False),
             ( 18,18,0.95,True),(-20,0,1.1,False), ( 20,0,1.15,True),
@@ -98,62 +123,75 @@ class World:
             (-19,8,1.0,False), (19,-8,1.0,True),  (-7,-19,0.9,True),
             ( 7,19,0.95,False),
         ]
+        mesh_green = tree_mesh(pink=False)
+        mesh_pink  = tree_mesh(pink=True)
         for x, z, s, pink in tree_data:
-            self.trees.append(Tree(x, z, s, pink=pink))
+            pairs.append((mesh_pink if pink else mesh_green,
+                          _M(x, 0, z, yaw=random.uniform(0, 6.28), s=s)))
+            self._aabbs.append(make_aabb((x, 1.5, z), (0.55*s, 3.5, 0.55*s)))
 
-        self.houses = [House(x,z,yaw) for x,z,yaw in
-                       [(-19,-14,0.5),(19,14,math.pi),
-                        (-16,19,1.0),(16,-19,2.5)]]
+        # Casas
+        mesh_house = house_mesh()
+        for x, z, yaw in [(-19,-14,0.5),(19,14,math.pi),
+                          (-16,19,1.0),(16,-19,2.5)]:
+            pairs.append((mesh_house, _M(x, 0, z, yaw=yaw)))
+            self._aabbs.append(make_aabb((x, 1.5, z), (1.9, 3.5, 1.6)))
 
-        obs_c = [(o.pos[0], o.pos[2]) for o in self.obstacles]
-        def clear(x, z, d=2.0):
-            return all(math.hypot(x-ox,z-oz) > d for ox,oz in obs_c)
+        obs_c = self._obstacle_centers
+        def clear(x, z, dist=2.0):
+            return all(math.hypot(x-ox,z-oz) > dist for ox,oz in obs_c)
 
-        # Flores (muitas! jardim florido)
-        self.flowers: List[Flower] = []
-        for _ in range(55):
-            for _try in range(20):
+        # Flores (3 meshes compartilhadas por cor; quantidade × densidade)
+        FLOWER_COLORS = [(245,170,185),(255,215,130),(205,170,235),
+                         (252,245,235),(255,180,150),(180,215,250)]
+        flower_meshes = [flower_mesh(c) for c in FLOWER_COLORS]
+        for _ in range(int(55 * d)):
+            for _t in range(20):
                 x = random.uniform(-20, 20); z = random.uniform(-20, 20)
                 if clear(x,z) and (abs(x)>2.2 or abs(z)>2.2):
-                    self.flowers.append(Flower(x, z)); break
+                    pairs.append((random.choice(flower_meshes),
+                                  _M(x, 0, z, yaw=random.uniform(0,6.28),
+                                     s=random.uniform(0.85, 1.3))))
+                    break
 
-        # Cogumelos perto das árvores
-        self.mushrooms: List[Mushroom] = []
-        for tree in self.trees[:10]:
-            for _ in range(random.randint(1, 2)):
-                a = random.uniform(0, 2*math.pi)
-                r = random.uniform(1.2, 2.2)
-                mx = tree.pos[0] + math.cos(a)*r
-                mz = tree.pos[2] + math.sin(a)*r
-                if abs(mx) < 20.5 and abs(mz) < 20.5:
-                    self.mushrooms.append(Mushroom(mx, mz))
+        # Cogumelos perto das árvores (compartilha 2 variantes)
+        mush = [mushroom_mesh(0.9), mushroom_mesh(1.3)]
+        for x, z, s, pink in tree_data[:int(10 * d)]:
+            a = random.uniform(0, 2*math.pi)
+            r = random.uniform(1.2, 2.2)
+            mx, mz = x + math.cos(a)*r, z + math.sin(a)*r
+            if abs(mx) < 20.5 and abs(mz) < 20.5:
+                pairs.append((random.choice(mush),
+                              _M(mx, 0, mz, yaw=random.uniform(0,6.28))))
 
-        # Lanternas ao longo do caminho central
-        self.lanterns: List[Lantern] = []
-        for d in [-15, -9, 9, 15]:
-            self.lanterns.append(Lantern(d, 2.6))
-            self.lanterns.append(Lantern(2.6, d))
+        # Lanternas no caminho
+        mesh_lant = lantern_mesh()
+        for dd in [-15, -9, 9, 15]:
+            pairs.append((mesh_lant, _M(dd, 0, 2.6)))
+            pairs.append((mesh_lant, _M(2.6, 0, dd)))
 
-        # Arbustos redondinhos
-        self.bushes: List[Bush] = []
-        for _ in range(14):
-            for _try in range(20):
+        # Arbustos (2 variantes compartilhadas)
+        bushes = [bush_mesh(0.9), bush_mesh(1.4)]
+        for _ in range(int(14 * d)):
+            for _t in range(20):
                 x = random.uniform(-19, 19); z = random.uniform(-19, 19)
                 if clear(x, z, 2.6) and (abs(x)>3.5 or abs(z)>3.5):
-                    self.bushes.append(Bush(x, z)); break
+                    pairs.append((random.choice(bushes),
+                                  _M(x, 0, z, yaw=random.uniform(0,6.28))))
+                    break
 
-        # Cerquinha branca decorativa (esparsa, perto dos muros)
-        self.fences: List[Fence] = []
+        # Cerquinha branca
+        mesh_fence = fence_segment_mesh(3.0)
         for x in range(-15, 16, 6):
-            self.fences.append(Fence(x, WORLD_Z[0]+2.2, 0))
-            self.fences.append(Fence(x, WORLD_Z[1]-2.2, 0))
+            pairs.append((mesh_fence, _M(x, 0, WORLD_Z[0]+2.2)))
+            pairs.append((mesh_fence, _M(x, 0, WORLD_Z[1]-2.2)))
         for z in range(-15, 16, 6):
-            self.fences.append(Fence(WORLD_X[0]+2.2, z, math.pi/2))
-            self.fences.append(Fence(WORLD_X[1]-2.2, z, math.pi/2))
+            pairs.append((mesh_fence, _M(WORLD_X[0]+2.2, 0, z, yaw=math.pi/2)))
+            pairs.append((mesh_fence, _M(WORLD_X[1]-2.2, 0, z, yaw=math.pi/2)))
 
     def _spawn_collectibles(self, n_fish, n_stars):
         self.fishes: List[Fish] = []
-        obs_c = [(o.pos[0], o.pos[2]) for o in self.obstacles]
+        obs_c = self._obstacle_centers
         def safe(x, z):
             if any(math.hypot(x-ox,z-oz) < 2.8 for ox,oz in obs_c):
                 return False
@@ -166,42 +204,17 @@ class World:
                 if safe(x, z):
                     self.fishes.append(Fish(x, z, is_star=is_star)); placed += 1
 
+    # ── Acesso ───────────────────────────────────────────────────────────────
+
     @property
     def all_obstacle_aabbs(self) -> List[AABB]:
-        return ([o.aabb for o in self.obstacles] +
-                [t.aabb for t in self.trees] +
-                [h.aabb for h in self.houses] +
-                self.wall_aabbs)
+        return self._aabbs       # cacheado (era recriado todo frame)
 
-    def update(self, dt):
-        for f in self.flowers:
-            f.update(dt)
+    def render(self, renderer: Renderer):
+        renderer.submit_static(self.static_batch)
 
-    def render(self, renderer: Renderer, view):
-        for mesh, M in self._floor_tiles:
-            renderer.render_mesh(mesh, M, view)
-        for fence in self.fences:
-            renderer.render_mesh(fence.mesh, fence.model_matrix(), view)
-        for fl in self.flowers:
-            renderer.render_mesh(fl.mesh, fl.model_matrix(), view)
-        for m in self.mushrooms:
-            renderer.render_mesh(m.mesh, m.model_matrix(), view)
-        for b in self.bushes:
-            renderer.render_mesh(b.mesh, b.model_matrix(), view)
-        for l in self.lanterns:
-            renderer.render_mesh(l.mesh, l.model_matrix(), view)
-        for h in self.houses:
-            renderer.render_mesh(h.mesh, h.model_matrix(), view)
-        for t in self.trees:
-            renderer.render_mesh(t.mesh, t.model_matrix(), view)
-        for mesh, M in self._wall_data:
-            renderer.render_mesh(mesh, M, view)
-        for o in self.obstacles:
-            renderer.render_mesh(o.mesh, o.model_matrix(), view)
-
-    def render_collectibles(self, renderer: Renderer, view):
+    def render_collectibles(self, renderer: Renderer):
         for fish in self.fishes:
             if not fish.collected or fish.collect_anim < 1.2:
                 tint = (255,255,255) if fish.collect_anim > 0 else None
-                renderer.render_mesh(fish.mesh, fish.model_matrix(),
-                                     view, tint=tint)
+                renderer.submit_mesh(fish.prep, fish.model_matrix(), tint=tint)

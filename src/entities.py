@@ -1,15 +1,10 @@
 """
-entities.py – Entidades com movimentação arcade precisa (RT-02, RF-01)
+entities.py – Entidades dinâmicas com meshes COMPARTILHADAS (RT-02, RF-01)
 
-Filosofia da movimentação (responsiva e fluida):
-  - Aceleração rápida (~0.18s até velocidade máxima) → resposta imediata
-  - Frenagem rápida (~0.12s até parar) → controle preciso
-  - Giro direto com leve suavização → sem "deriva" de inércia angular
-  - Colisão por DESLIZAMENTO: remove só o componente da velocidade
-    na direção do obstáculo → o gato desliza ao longo de paredes
-    em vez de quicar ou travar
-  - Dash curto (SHIFT) com cooldown
-  - Animações sutis: bob de caminhada, inclinação na curva, squash na coleta
+Otimização: todos os peixes compartilham UMA malha pré-processada
+(antes: cada peixe criava sua própria cópia — 18× a memória e o
+tempo de inicialização). O gato pré-processa sua malha uma vez.
+A movimentação arcade precisa com deslizamento é mantida da v3.
 """
 
 import numpy as np
@@ -19,26 +14,35 @@ from typing import List
 
 from math3d import (translation_matrix, rotation_y, rotation_z,
                     rotation_x, scale_matrix)
-from geometry import (cat_body_mesh, fish_mesh, star_mesh, tree_mesh,
-                      house_mesh, crate_mesh, stone_mesh, flower_mesh,
-                      fence_segment_mesh, mushroom_mesh, lantern_mesh,
-                      bush_mesh)
-from collision import AABB, Sphere, make_aabb, make_sphere
+from geometry import cat_body_mesh, fish_mesh, star_mesh
+from collision import AABB, make_sphere
+from renderer import PreparedMesh
+
+# ── Meshes compartilhadas (criadas uma única vez) ─────────────────────────────
+_FISH_PREP = None
+_STAR_PREP = None
+
+def get_fish_prep():
+    global _FISH_PREP
+    if _FISH_PREP is None:
+        _FISH_PREP = PreparedMesh(fish_mesh())
+    return _FISH_PREP
+
+def get_star_prep():
+    global _STAR_PREP
+    if _STAR_PREP is None:
+        _STAR_PREP = PreparedMesh(star_mesh())
+    return _STAR_PREP
 
 
 class Cat:
-    """
-    Agente com controle arcade preciso.
-
-    Transformação composta (RT-02):
-      M = T(pos+bob) · Ry(yaw) · Rz(lean) · Rx(pitch) · S(squash)
-    """
+    """Agente com controle arcade preciso (deslizamento em colisões)."""
 
     MAX_SPEED   = 9.0
-    ACCEL_TIME  = 0.18    # segundos até velocidade máxima
-    BRAKE_TIME  = 0.12    # segundos até parar
-    TURN_SPEED  = math.pi * 1.6   # rad/s
-    TURN_SMOOTH = 18.0    # suavização do giro (alto = responsivo)
+    ACCEL_TIME  = 0.18
+    BRAKE_TIME  = 0.12
+    TURN_SPEED  = math.pi * 1.6
+    TURN_SMOOTH = 18.0
     DASH_SPEED  = 17.0
     DASH_TIME   = 0.16
     DASH_CD     = 1.0
@@ -47,25 +51,18 @@ class Cat:
         self.pos      = np.array([x, 0.80, z], dtype=np.float64)
         self.vel      = np.array([0.0, 0.0, 0.0])
         self.yaw      = 0.0
-        self.yaw_vel  = 0.0      # taxa de giro suavizada
+        self.yaw_vel  = 0.0
         self.radius   = 0.58
-
-        # Animação
         self.bob_time = 0.0
         self.lean     = 0.0
         self.pitch    = 0.0
         self.squash   = 1.0
-
-        # Dash
         self.dash_t   = 0.0
         self.dash_cd  = 0.0
         self.dashing  = False
-
-        # Para feedback (câmera)
-        self.bump     = 0.0   # intensidade de impacto recente
-
-        self.mesh  = cat_body_mesh()
-        self.scale = 0.58
+        self.bump     = 0.0
+        self.prep     = PreparedMesh(cat_body_mesh())
+        self.scale    = 0.58
 
     @property
     def sphere(self):
@@ -94,9 +91,7 @@ class Cat:
     def model_matrix(self):
         spd_t = min(1.0, self.speed / self.MAX_SPEED)
         bob_y = math.sin(self.bob_time * 10.0) * 0.05 * spd_t
-        # Respiração sutil quando parado
         breath = math.sin(self.bob_time * 2.0) * 0.015 * (1.0 - spd_t)
-
         T  = translation_matrix(self.pos[0], self.pos[1] + bob_y + breath,
                                 self.pos[2])
         Ry = rotation_y(self.yaw)
@@ -108,30 +103,24 @@ class Cat:
         return T @ Ry @ Rz @ Rx @ S
 
     def collect_bounce(self):
-        """Pequeno pulo de alegria ao coletar (squash & stretch)."""
         self.squash = 1.22
 
     def update(self, dt, keys, world_bounds, obstacles: List[AABB]):
         import pygame
 
-        # ── Entrada ───────────────────────────────────────────────────────────
         turn = 0.0
         if keys[pygame.K_LEFT]  or keys[pygame.K_a]: turn += 1.0
         if keys[pygame.K_RIGHT] or keys[pygame.K_d]: turn -= 1.0
-
         fwd = 0.0
         if keys[pygame.K_UP]   or keys[pygame.K_w]: fwd += 1.0
         if keys[pygame.K_DOWN] or keys[pygame.K_s]: fwd -= 0.55
-
         dash_key = keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT]
 
-        # ── Giro: direto com leve suavização (responsivo, sem deriva) ─────────
         target_yaw_vel = turn * self.TURN_SPEED
         blend = min(1.0, self.TURN_SMOOTH * dt)
         self.yaw_vel += (target_yaw_vel - self.yaw_vel) * blend
         self.yaw += self.yaw_vel * dt
 
-        # ── Dash ─────────────────────────────────────────────────────────────
         self.dash_cd = max(0.0, self.dash_cd - dt)
         if self.dash_t > 0:
             self.dash_t -= dt
@@ -142,68 +131,50 @@ class Cat:
             self.dashing = True
             self.squash  = 0.80
 
-        # ── Velocidade: aceleração/frenagem rápidas (arcade) ─────────────────
         fwd_dir = np.array([math.sin(self.yaw), 0.0, math.cos(self.yaw)])
         max_spd = self.DASH_SPEED if self.dashing else self.MAX_SPEED
-        target_vel = fwd_dir * fwd * max_spd
-        if self.dashing:
-            target_vel = fwd_dir * max_spd  # dash sempre pra frente
+        target_vel = fwd_dir * (max_spd if self.dashing else fwd * max_spd)
 
-        # Tempo de resposta diferente para acelerar vs frear
-        accelerating = np.dot(target_vel, target_vel) > np.dot(
-            np.array([self.vel[0],0,self.vel[2]]),
-            np.array([self.vel[0],0,self.vel[2]]))
-        response = self.ACCEL_TIME if accelerating else self.BRAKE_TIME
+        cur_sq = self.vel[0]**2 + self.vel[2]**2
+        tgt_sq = target_vel[0]**2 + target_vel[2]**2
+        response = self.ACCEL_TIME if tgt_sq > cur_sq else self.BRAKE_TIME
         alpha = min(1.0, dt / response)
-
         self.vel[0] += (target_vel[0] - self.vel[0]) * alpha
         self.vel[2] += (target_vel[2] - self.vel[2]) * alpha
 
-        # ── Movimento com colisão por DESLIZAMENTO ────────────────────────────
-        step = self.vel * dt
-        new_pos = self.pos + step
+        new_pos = self.pos + self.vel * dt
 
-        # Paredes do mundo: desliza (zera só o eixo que colide)
         xmin, xmax, zmin, zmax = world_bounds
         margin = 0.85
         if new_pos[0] < xmin + margin:
             new_pos[0] = xmin + margin
             if self.vel[0] < 0:
-                self.bump = max(self.bump, abs(self.vel[0])*0.4)
-                self.vel[0] = 0.0
+                self.bump = max(self.bump, abs(self.vel[0])*0.4); self.vel[0] = 0.0
         elif new_pos[0] > xmax - margin:
             new_pos[0] = xmax - margin
             if self.vel[0] > 0:
-                self.bump = max(self.bump, abs(self.vel[0])*0.4)
-                self.vel[0] = 0.0
+                self.bump = max(self.bump, abs(self.vel[0])*0.4); self.vel[0] = 0.0
         if new_pos[2] < zmin + margin:
             new_pos[2] = zmin + margin
             if self.vel[2] < 0:
-                self.bump = max(self.bump, abs(self.vel[2])*0.4)
-                self.vel[2] = 0.0
+                self.bump = max(self.bump, abs(self.vel[2])*0.4); self.vel[2] = 0.0
         elif new_pos[2] > zmax - margin:
             new_pos[2] = zmax - margin
             if self.vel[2] > 0:
-                self.bump = max(self.bump, abs(self.vel[2])*0.4)
-                self.vel[2] = 0.0
+                self.bump = max(self.bump, abs(self.vel[2])*0.4); self.vel[2] = 0.0
 
-        # Obstáculos: resolve por eixo separado → desliza naturalmente
-        # (testa movimento em X e Z independentemente)
+        # Deslizamento: testa eixos separadamente
         test = make_sphere((new_pos[0], self.pos[1], self.pos[2]), self.radius)
         blocked_x = any(test.intersects_aabb(o) for o in obstacles)
         test = make_sphere((self.pos[0], self.pos[1], new_pos[2]), self.radius)
         blocked_z = any(test.intersects_aabb(o) for o in obstacles)
-
         if blocked_x:
             self.bump = max(self.bump, abs(self.vel[0]) * 0.3)
-            new_pos[0] = self.pos[0]
-            self.vel[0] = 0.0
+            new_pos[0] = self.pos[0]; self.vel[0] = 0.0
         if blocked_z:
             self.bump = max(self.bump, abs(self.vel[2]) * 0.3)
-            new_pos[2] = self.pos[2]
-            self.vel[2] = 0.0
+            new_pos[2] = self.pos[2]; self.vel[2] = 0.0
 
-        # Caso raro: preso na diagonal → empurra para fora
         test = make_sphere(tuple(new_pos), self.radius)
         for o in obstacles:
             if test.intersects_aabb(o):
@@ -214,25 +185,20 @@ class Cat:
                     new_pos += (diff/d) * 0.08
 
         self.pos = new_pos
-        self.bump *= math.pow(0.05, dt)   # decai rápido
+        self.bump *= math.pow(0.05, dt)
 
-        # ── Animações ─────────────────────────────────────────────────────────
         spd_t = min(1.0, self.speed / self.MAX_SPEED)
         self.bob_time += dt * (0.4 + spd_t)
-
-        # Inclina na curva (sutil)
         target_lean = -self.yaw_vel * 0.05 * spd_t
         self.lean += (target_lean - self.lean) * min(1.0, dt * 14)
-
-        # Inclina o nariz pra baixo levemente ao correr (gato focado!)
         target_pitch = spd_t * 0.06 + (0.12 if self.dashing else 0.0)
         self.pitch += (target_pitch - self.pitch) * min(1.0, dt * 10)
-
-        # Squash volta ao normal
         self.squash += (1.0 - self.squash) * min(1.0, dt * 12)
 
 
 class Fish:
+    """Coletável. Compartilha a malha pré-processada com todos os peixes."""
+
     def __init__(self, x, z, is_star=False):
         self.pos          = np.array([x, 1.25, z], dtype=np.float64)
         self.rot_y        = random.uniform(0, math.pi*2)
@@ -241,7 +207,7 @@ class Fish:
         self.is_star      = is_star
         self.points       = 50 if is_star else 10
         self.collect_anim = 0.0
-        self.mesh         = star_mesh() if is_star else fish_mesh()
+        self.prep         = get_star_prep() if is_star else get_fish_prep()
         self.base_scale   = 1.0 if is_star else 0.95
 
     def model_matrix(self):
@@ -266,107 +232,3 @@ class Fish:
             self.rot_y += dt * (2.0 if self.is_star else 1.3)
         else:
             self.collect_anim += dt * 3.0
-
-
-class Obstacle:
-    def __init__(self, x, z, w=1.3, h=1.4, d=1.3):
-        self.pos = np.array([x, h/2, z], dtype=np.float64)
-        self.w, self.h, self.d = w, h, d
-        self.mesh = stone_mesh(w,h,d) if h < 1.0 else crate_mesh(w,h,d)
-
-    @property
-    def aabb(self):
-        return make_aabb(tuple(self.pos), (self.w/2, self.h/2, self.d/2))
-
-    def model_matrix(self):
-        return translation_matrix(self.pos[0], 0, self.pos[2])
-
-
-class Tree:
-    def __init__(self, x, z, scale=1.0, pink=False):
-        self.pos     = np.array([x, 0, z], dtype=np.float64)
-        self.scale_v = scale
-        self.mesh    = tree_mesh(pink=pink)
-        self.yaw     = random.uniform(0, math.pi*2)
-
-    def model_matrix(self):
-        T = translation_matrix(self.pos[0], 0, self.pos[2])
-        return T @ rotation_y(self.yaw) @ scale_matrix(
-            self.scale_v, self.scale_v, self.scale_v)
-
-    @property
-    def aabb(self):
-        return make_aabb((self.pos[0], 1.5, self.pos[2]),
-                         (0.55*self.scale_v, 3.5, 0.55*self.scale_v))
-
-
-class House:
-    def __init__(self, x, z, yaw=0):
-        self.pos, self.yaw = np.array([x,0,z],dtype=np.float64), yaw
-        self.mesh = house_mesh()
-
-    def model_matrix(self):
-        return translation_matrix(*self.pos) @ rotation_y(self.yaw)
-
-    @property
-    def aabb(self):
-        return make_aabb((self.pos[0], 1.5, self.pos[2]), (1.9, 3.5, 1.6))
-
-
-class Flower:
-    COLORS = [(245,170,185),(255,215,130),(205,170,235),
-              (252,245,235),(255,180,150),(180,215,250)]
-
-    def __init__(self, x, z):
-        self.pos  = np.array([x, 0, z], dtype=np.float64)
-        self.yaw  = random.uniform(0, math.pi*2)
-        self.time = random.uniform(0, math.pi*2)
-        self.mesh = flower_mesh(random.choice(self.COLORS))
-        self.scale_v = random.uniform(0.85, 1.3)
-
-    def model_matrix(self):
-        sway = math.sin(self.time * 0.9) * 0.06
-        return (translation_matrix(*self.pos) @ rotation_y(self.yaw)
-                @ rotation_z(sway)
-                @ scale_matrix(self.scale_v, self.scale_v, self.scale_v))
-
-    def update(self, dt):
-        self.time += dt
-
-
-class Mushroom:
-    def __init__(self, x, z):
-        self.pos  = np.array([x, 0, z], dtype=np.float64)
-        self.yaw  = random.uniform(0, math.pi*2)
-        self.mesh = mushroom_mesh(random.uniform(0.8, 1.4))
-
-    def model_matrix(self):
-        return translation_matrix(*self.pos) @ rotation_y(self.yaw)
-
-
-class Lantern:
-    def __init__(self, x, z):
-        self.pos  = np.array([x, 0, z], dtype=np.float64)
-        self.mesh = lantern_mesh()
-
-    def model_matrix(self):
-        return translation_matrix(*self.pos)
-
-
-class Bush:
-    def __init__(self, x, z):
-        self.pos  = np.array([x, 0, z], dtype=np.float64)
-        self.yaw  = random.uniform(0, math.pi*2)
-        self.mesh = bush_mesh(random.uniform(0.8, 1.5))
-
-    def model_matrix(self):
-        return translation_matrix(*self.pos) @ rotation_y(self.yaw)
-
-
-class Fence:
-    def __init__(self, x, z, yaw=0):
-        self.pos, self.yaw = np.array([x,0,z],dtype=np.float64), yaw
-        self.mesh = fence_segment_mesh(3.0)
-
-    def model_matrix(self):
-        return translation_matrix(*self.pos) @ rotation_y(self.yaw)
